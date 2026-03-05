@@ -1,0 +1,9 @@
+/build/
+/install/
+/log/
+
+# Python artifacts
+**/__pycache__/
+
+# IDE / tooling
+.vscode/
