@@ -5,6 +5,7 @@ import collections
 import collections.abc
 import os
 import sys
+import time
 
 _COLLECTIONS_COMPAT_ATTRS = (
     "Mapping",
@@ -47,7 +48,8 @@ from kortex_api.RouterClient import RouterClient, RouterClientSendOptions
 from kortex_api.SessionManager import SessionManager
 from kortex_api.TCPTransport import TCPTransport
 from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient
-from kortex_api.autogen.messages import Base_pb2, Session_pb2
+from kortex_api.autogen.client_stubs.ControlConfigClientRpc import ControlConfigClient
+from kortex_api.autogen.messages import Base_pb2, ControlConfig_pb2, Session_pb2
 
 
 @dataclass
@@ -114,6 +116,13 @@ def quaternion_to_euler_deg(x: float, y: float, z: float, w: float):
     return math.degrees(roll), math.degrees(pitch), math.degrees(yaw)
 
 
+def control_mode_name(mode: int) -> str:
+    try:
+        return ControlConfig_pb2.ControlMode.Name(mode)
+    except ValueError:
+        return f"UNKNOWN_CONTROL_MODE_{mode}"
+
+
 class KinovaPoseControllerNode(Node):
     def __init__(self):
         super().__init__("kinova_pose_controller")
@@ -137,14 +146,62 @@ class KinovaPoseControllerNode(Node):
         router = self._session.__enter__()
         self.get_logger().info("Kortex session established")
         self._base = BaseClient(router)
+        self._control_config = ControlConfigClient(router)
+        self._hard_limits = None
 
         self._move_lock = threading.Lock()
         self._pose_sub = self.create_subscription(PoseStamped, "target_pose", self._on_target_pose, 10)
         self._ee_pose_timer = self.create_timer(1.0, self._log_measured_cartesian_pose)
 
+        self._set_cartesian_soft_limits_to_hard_limits()
+        self._log_kinematic_constraints()
         self.get_logger().info(
             f"Connected to Kinova Gen3 at {config.ip}:{config.port}. Listening on topic 'target_pose'."
         )
+
+    def run(self):
+        """
+        Put direct cartesian motion logic here using meters and Euler angles in degrees.
+        Return after sending any motions you want this node to execute.
+        """
+        current_pose = self._base.GetMeasuredCartesianPose()
+        self.get_logger().info(
+            "Current EE pose before run() "
+            f"x={current_pose.x:.3f}, y={current_pose.y:.3f}, z={current_pose.z:.3f}, "
+            f"theta_x={current_pose.theta_x:.1f}, theta_y={current_pose.theta_y:.1f}, "
+            f"theta_z={current_pose.theta_z:.1f}"
+        )
+
+        # XYZ position is in relation to base frame
+        # theta x, theta y are in relation to end effector pose
+        # theta z is in relation to base frame
+
+        # Example start position
+        self.move_to_euler_pose(
+            x=0.565,
+            y=-0.047,
+            z=0.337,
+            theta_x_deg=175.6,
+            theta_y_deg=-3.8,
+            theta_z_deg=86.7,
+        )
+
+        # time.sleep(5)
+
+        # example interception position
+        self.move_to_euler_pose(
+            x=0.216,
+            y=0.021,
+            z=0.086,
+            theta_x_deg=175.6,
+            theta_y_deg=-6.5,
+            theta_z_deg=98.0,
+        )
+
+        # if ok:
+        #     self.get_logger().info("run() motion finished successfully")
+        # else:
+        #     self.get_logger().error("run() motion failed")
 
     def destroy_node(self):
         self.get_logger().info("Closing Kortex session...")
@@ -194,6 +251,101 @@ class KinovaPoseControllerNode(Node):
             f"theta_x={pose.theta_x:.1f}, theta_y={pose.theta_y:.1f}, theta_z={pose.theta_z:.1f}"
         )
 
+    def _log_kinematic_constraints(self):
+        try:
+            hard_limits = self._control_config.GetKinematicHardLimits()
+        except Exception as exc:
+            self.get_logger().error(f"Failed to query hard kinematic limits: {exc}")
+        else:
+            self._hard_limits = hard_limits
+            self.get_logger().info(
+                "Hard limits "
+                f"mode={control_mode_name(hard_limits.control_mode)}, "
+                f"twist_linear={hard_limits.twist_linear:.3f} m/s, "
+                f"twist_angular={hard_limits.twist_angular:.1f} deg/s, "
+                f"joint_speed_limits={[round(v, 3) for v in hard_limits.joint_speed_limits]}, "
+                f"joint_acceleration_limits={[round(v, 3) for v in hard_limits.joint_acceleration_limits]}"
+            )
+
+        try:
+            soft_limits = self._control_config.GetAllKinematicSoftLimits()
+        except Exception as exc:
+            self.get_logger().error(f"Failed to query soft kinematic limits: {exc}")
+            return
+
+        for limits in soft_limits.kinematic_limits_list:
+            self.get_logger().info(
+                "Soft limits "
+                f"mode={control_mode_name(limits.control_mode)}, "
+                f"twist_linear={limits.twist_linear:.3f} m/s, "
+                f"twist_angular={limits.twist_angular:.1f} deg/s, "
+                f"joint_speed_limits={[round(v, 3) for v in limits.joint_speed_limits]}, "
+                f"joint_acceleration_limits={[round(v, 3) for v in limits.joint_acceleration_limits]}"
+            )
+
+    def _set_cartesian_soft_limits_to_hard_limits(self):
+        try:
+            hard_limits = self._control_config.GetKinematicHardLimits()
+        except Exception as exc:
+            self.get_logger().error(f"Failed to query hard limits before setting soft limits: {exc}")
+            return
+
+        self._hard_limits = hard_limits
+
+        linear_limit = ControlConfig_pb2.TwistLinearSoftLimit()
+        linear_limit.twist_linear_soft_limit = hard_limits.twist_linear
+
+        angular_limit = ControlConfig_pb2.TwistAngularSoftLimit()
+        angular_limit.twist_angular_soft_limit = hard_limits.twist_angular
+
+        cartesian_modes = (
+            ControlConfig_pb2.CARTESIAN_JOYSTICK,
+            ControlConfig_pb2.CARTESIAN_TRAJECTORY,
+            ControlConfig_pb2.CARTESIAN_WAYPOINT_TRAJECTORY,
+        )
+
+        for mode in cartesian_modes:
+            linear_limit.control_mode = mode
+            angular_limit.control_mode = mode
+            try:
+                self._control_config.SetTwistLinearSoftLimit(linear_limit)
+                self._control_config.SetTwistAngularSoftLimit(angular_limit)
+            except Exception as exc:
+                self.get_logger().error(
+                    f"Failed to set soft Cartesian limits for mode={control_mode_name(mode)}: {exc}"
+                )
+                continue
+
+            self.get_logger().info(
+                "Set soft Cartesian limits "
+                f"mode={control_mode_name(mode)}, "
+                f"twist_linear={hard_limits.twist_linear:.3f} m/s, "
+                f"twist_angular={hard_limits.twist_angular:.1f} deg/s"
+            )
+
+    def move_to_euler_pose(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        theta_x_deg: float,
+        theta_y_deg: float,
+        theta_z_deg: float,
+    ) -> bool:
+        self.get_logger().info(
+            "Executing direct euler move to "
+            f"x={x:.3f}, y={y:.3f}, z={z:.3f}, "
+            f"theta_x={theta_x_deg:.1f}, theta_y={theta_y_deg:.1f}, theta_z={theta_z_deg:.1f}"
+        )
+        return self._execute_cartesian_action(
+            x=x,
+            y=y,
+            z=z,
+            theta_x=theta_x_deg,
+            theta_y=theta_y_deg,
+            theta_z=theta_z_deg,
+        )
+
     def _execute_cartesian_action(
         self,
         x: float,
@@ -227,6 +379,15 @@ class KinovaPoseControllerNode(Node):
         target_pose.theta_y = theta_y
         target_pose.theta_z = theta_z
 
+        translation_speed = 0.5
+        orientation_speed = 100.0
+        if self._hard_limits is not None:
+            translation_speed = self._hard_limits.twist_linear
+            orientation_speed = self._hard_limits.twist_angular
+
+        action.reach_pose.constraint.speed.translation = translation_speed
+        action.reach_pose.constraint.speed.orientation = orientation_speed
+
         try:
             self._base.ExecuteAction(action)
         except Exception as exc:
@@ -244,6 +405,7 @@ def main(args=None):
     node = KinovaPoseControllerNode()
 
     try:
+        node.run()
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
