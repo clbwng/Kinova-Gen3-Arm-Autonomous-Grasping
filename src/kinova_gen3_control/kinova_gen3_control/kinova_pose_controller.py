@@ -3,6 +3,8 @@
 # --- MUST be first: patch collections for old protobuf (Python 3.10+) ---
 import collections
 import collections.abc
+import os
+import sys
 
 _COLLECTIONS_COMPAT_ATTRS = (
     "Mapping",
@@ -18,6 +20,20 @@ for _name in _COLLECTIONS_COMPAT_ATTRS:
         setattr(collections, _name, getattr(collections.abc, _name))
 # -----------------------------------------------------------------------
 
+
+def _add_active_venv_site_packages():
+    venv = os.environ.get("VIRTUAL_ENV")
+    if not venv:
+        return
+
+    py_version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    site_packages = os.path.join(venv, "lib", py_version, "site-packages")
+    if os.path.isdir(site_packages) and site_packages not in sys.path:
+        sys.path.insert(0, site_packages)
+
+
+_add_active_venv_site_packages()
+
 import math
 import threading
 from dataclasses import dataclass
@@ -27,7 +43,7 @@ import rclpy
 from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
 
-from kortex_api.RouterClient import RouterClient
+from kortex_api.RouterClient import RouterClient, RouterClientSendOptions
 from kortex_api.SessionManager import SessionManager
 from kortex_api.TCPTransport import TCPTransport
 from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient
@@ -68,7 +84,7 @@ class KortexSession:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self._session_manager is not None:
-            router_options = RouterClient.RouterClientSendOptions()
+            router_options = RouterClientSendOptions()
             router_options.timeout_ms = 1000
             self._session_manager.CloseSession(router_options)
 
@@ -117,11 +133,14 @@ class KinovaPoseControllerNode(Node):
         self._action_timeout_s = self.get_parameter("action_timeout_s").get_parameter_value().double_value
 
         self._session = KortexSession(config)
+        self.get_logger().info(f"Connecting to Kinova Gen3 at {config.ip}:{config.port}...")
         router = self._session.__enter__()
+        self.get_logger().info("Kortex session established")
         self._base = BaseClient(router)
 
         self._move_lock = threading.Lock()
         self._pose_sub = self.create_subscription(PoseStamped, "target_pose", self._on_target_pose, 10)
+        self._ee_pose_timer = self.create_timer(1.0, self._log_measured_cartesian_pose)
 
         self.get_logger().info(
             f"Connected to Kinova Gen3 at {config.ip}:{config.port}. Listening on topic 'target_pose'."
@@ -162,6 +181,19 @@ class KinovaPoseControllerNode(Node):
             else:
                 self.get_logger().error("Move failed or timed out")
 
+    def _log_measured_cartesian_pose(self):
+        try:
+            pose = self._base.GetMeasuredCartesianPose()
+        except Exception as exc:
+            self.get_logger().error(f"Failed to read measured cartesian pose: {exc}")
+            return
+
+        self.get_logger().info(
+            "EE pose "
+            f"x={pose.x:.3f}, y={pose.y:.3f}, z={pose.z:.3f}, "
+            f"theta_x={pose.theta_x:.1f}, theta_y={pose.theta_y:.1f}, theta_z={pose.theta_z:.1f}"
+        )
+
     def _execute_cartesian_action(
         self,
         x: float,
@@ -195,7 +227,13 @@ class KinovaPoseControllerNode(Node):
         target_pose.theta_y = theta_y
         target_pose.theta_z = theta_z
 
-        self._base.ExecuteAction(action)
+        try:
+            self._base.ExecuteAction(action)
+        except Exception as exc:
+            self.get_logger().error(f"ExecuteAction failed: {exc}")
+            self._base.Unsubscribe(notification_handle)
+            return False
+
         finished = done_event.wait(self._action_timeout_s)
         self._base.Unsubscribe(notification_handle)
         return finished
