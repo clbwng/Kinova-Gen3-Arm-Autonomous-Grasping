@@ -41,15 +41,37 @@ from dataclasses import dataclass
 from typing import Optional
 
 import rclpy
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import Point
+from std_msgs.msg import Bool
 from rclpy.node import Node
 
-from kortex_api.RouterClient import RouterClient, RouterClientSendOptions
+from kortex_api.RouterClisent import RouterClient, RouterClientSendOptions
 from kortex_api.SessionManager import SessionManager
 from kortex_api.TCPTransport import TCPTransport
 from kortex_api.autogen.client_stubs.BaseClientRpc import BaseClient
 from kortex_api.autogen.client_stubs.ControlConfigClientRpc import ControlConfigClient
 from kortex_api.autogen.messages import Base_pb2, ControlConfig_pb2, Session_pb2
+
+
+# ── Physical setup constants ──────────────────────────────────────────────────
+GOAL_LINE_X_MIN = 0.231
+GOAL_LINE_X_MAX = 0.522
+GOAL_LINE_Y     = 0.036
+GOAL_LINE_Z     = 0.007
+
+EE_THETA_X = 0
+EE_THETA_Y = 180
+EE_THETA_Z = 180
+
+HOME = {
+    "x":       0.351,
+    "y":      -0.488,
+    "z":       0.331,
+    "theta_x": -25,
+    "theta_y": 180,
+    "theta_z": 180,
+}
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 @dataclass
@@ -98,24 +120,6 @@ class KortexSession:
         print(f"Kortex router error: {exception}")
 
 
-def quaternion_to_euler_deg(x: float, y: float, z: float, w: float):
-    sinr_cosp = 2.0 * (w * x + y * z)
-    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
-    roll = math.atan2(sinr_cosp, cosr_cosp)
-
-    sinp = 2.0 * (w * y - z * x)
-    if abs(sinp) >= 1.0:
-        pitch = math.copysign(math.pi / 2.0, sinp)
-    else:
-        pitch = math.asin(sinp)
-
-    siny_cosp = 2.0 * (w * z + x * y)
-    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
-    yaw = math.atan2(siny_cosp, cosy_cosp)
-
-    return math.degrees(roll), math.degrees(pitch), math.degrees(yaw)
-
-
 def control_mode_name(mode: int) -> str:
     try:
         return ControlConfig_pb2.ControlMode.Name(mode)
@@ -150,93 +154,102 @@ class KinovaPoseControllerNode(Node):
         self._hard_limits = None
 
         self._move_lock = threading.Lock()
-        self._pose_sub = self.create_subscription(PoseStamped, "target_pose", self._on_target_pose, 10)
+
+        # ── Subscribe to intercept point ──────────────────────────────────
+        # msg.x = predicted X where ball crosses goal line
+        self._intercept_sub = self.create_subscription(
+            Point,
+            "intercept_point",
+            self._on_intercept_point,
+            10
+        )
+
+        # ── Subscribe to home command ─────────────────────────────────────
+        # Any message on this topic sends arm back to home position
+        # Published by perception_node when 'r' is pressed
+        self._home_sub = self.create_subscription(
+            Bool,
+            "go_home",
+            self._on_go_home,
+            10
+        )
+
         self._ee_pose_timer = self.create_timer(1.0, self._log_measured_cartesian_pose)
 
         self._set_cartesian_soft_limits_to_hard_limits()
         self._log_kinematic_constraints()
         self.get_logger().info(
-            f"Connected to Kinova Gen3 at {config.ip}:{config.port}. Listening on topic 'target_pose'."
+            f"Connected to Kinova Gen3 at {config.ip}:{config.port}.\n"
+            f"Listening on 'intercept_point' (block) and 'go_home' (reset) topics."
         )
 
     def run(self):
-        """
-        Put direct cartesian motion logic here using meters and Euler angles in degrees.
-        Return after sending any motions you want this node to execute.
-        """
-        current_pose = self._base.GetMeasuredCartesianPose()
-        self.get_logger().info(
-            "Current EE pose before run() "
-            f"x={current_pose.x:.3f}, y={current_pose.y:.3f}, z={current_pose.z:.3f}, "
-            f"theta_x={current_pose.theta_x:.1f}, theta_y={current_pose.theta_y:.1f}, "
-            f"theta_z={current_pose.theta_z:.1f}"
+        """Move to home position on startup and wait."""
+        self.get_logger().info("Moving to home position...")
+        ok = self._execute_cartesian_action(
+            x=HOME["x"],
+            y=HOME["y"],
+            z=HOME["z"],
+            theta_x=HOME["theta_x"],
+            theta_y=HOME["theta_y"],
+            theta_z=HOME["theta_z"],
         )
+        if ok:
+            self.get_logger().info("Home position reached. Ready for demo.")
+        else:
+            self.get_logger().error("Failed to reach home position!")
 
-        # XYZ position is in relation to base frame
-        # theta x, theta y are in relation to end effector pose
-        # theta z is in relation to base frame
+    def _on_intercept_point(self, msg: Point):
+        """Move arm to predicted intercept X on goal line."""
+        with self._move_lock:
+            x_raw     = msg.x
+            x_clamped = max(GOAL_LINE_X_MIN, min(GOAL_LINE_X_MAX, x_raw))
 
-        # Example start position
-        self.move_to_euler_pose(
-            x=-0.565,
-            y=-0.047,
-            z=0.337,
-            theta_x_deg=0,
-            theta_y_deg=170.8,
-            theta_z_deg=86.7,
-        )
+            if abs(x_raw - x_clamped) > 0.001:
+                self.get_logger().warn(
+                    f"Intercept x={x_raw:.3f} out of bounds, "
+                    f"clamped to x={x_clamped:.3f}"
+                )
 
-        # time.sleep(5)
+            self.get_logger().info(
+                f"Intercept received: x={x_clamped:.3f} — moving to block..."
+            )
 
-        # example interception position
-        self.move_to_euler_pose(
-            x=-0.216,
-            y=0.021,
-            z=0.086,
-            theta_x_deg=0,
-            theta_y_deg=170.5,
-            theta_z_deg=98.0,
-        )
+            ok = self._execute_cartesian_action(
+                x=x_clamped,
+                y=GOAL_LINE_Y,
+                z=GOAL_LINE_Z,
+                theta_x=EE_THETA_X,
+                theta_y=EE_THETA_Y,
+                theta_z=EE_THETA_Z,
+            )
 
-        # if ok:
-        #     self.get_logger().info("run() motion finished successfully")
-        # else:
-        #     self.get_logger().error("run() motion failed")
+            if ok:
+                self.get_logger().info(f"Block position x={x_clamped:.3f} reached ✓")
+            else:
+                self.get_logger().error("Failed to reach block position!")
+
+    def _on_go_home(self, msg: Bool):
+        """Move arm back to home position for next demo run."""
+        with self._move_lock:
+            self.get_logger().info("Go home command received — returning to home...")
+            ok = self._execute_cartesian_action(
+                x=HOME["x"],
+                y=HOME["y"],
+                z=HOME["z"],
+                theta_x=HOME["theta_x"],
+                theta_y=HOME["theta_y"],
+                theta_z=HOME["theta_z"],
+            )
+            if ok:
+                self.get_logger().info("Home position reached. Ready for next demo run ✓")
+            else:
+                self.get_logger().error("Failed to reach home position!")
 
     def destroy_node(self):
         self.get_logger().info("Closing Kortex session...")
         self._session.__exit__(None, None, None)
         return super().destroy_node()
-
-    def _on_target_pose(self, msg: PoseStamped):
-        with self._move_lock:
-            pose = msg.pose
-            rx, ry, rz = quaternion_to_euler_deg(
-                pose.orientation.x,
-                pose.orientation.y,
-                pose.orientation.z,
-                pose.orientation.w,
-            )
-
-            self.get_logger().info(
-                "Executing cartesian move to "
-                f"x={pose.position.x:.3f}, y={pose.position.y:.3f}, z={pose.position.z:.3f}, "
-                f"theta_x={rx:.1f}, theta_y={ry:.1f}, theta_z={rz:.1f}"
-            )
-
-            ok = self._execute_cartesian_action(
-                x=pose.position.x,
-                y=pose.position.y,
-                z=pose.position.z,
-                theta_x=rx,
-                theta_y=ry,
-                theta_z=rz,
-            )
-
-            if ok:
-                self.get_logger().info("Move finished successfully")
-            else:
-                self.get_logger().error("Move failed or timed out")
 
     def _log_measured_cartesian_pose(self):
         try:
@@ -248,7 +261,8 @@ class KinovaPoseControllerNode(Node):
         self.get_logger().info(
             "EE pose "
             f"x={pose.x:.3f}, y={pose.y:.3f}, z={pose.z:.3f}, "
-            f"theta_x={pose.theta_x:.1f}, theta_y={pose.theta_y:.1f}, theta_z={pose.theta_z:.1f}"
+            f"theta_x={pose.theta_x:.1f}, theta_y={pose.theta_y:.1f}, "
+            f"theta_z={pose.theta_z:.1f}"
         )
 
     def _log_kinematic_constraints(self):
@@ -263,8 +277,10 @@ class KinovaPoseControllerNode(Node):
                 f"mode={control_mode_name(hard_limits.control_mode)}, "
                 f"twist_linear={hard_limits.twist_linear:.3f} m/s, "
                 f"twist_angular={hard_limits.twist_angular:.1f} deg/s, "
-                f"joint_speed_limits={[round(v, 3) for v in hard_limits.joint_speed_limits]}, "
-                f"joint_acceleration_limits={[round(v, 3) for v in hard_limits.joint_acceleration_limits]}"
+                f"joint_speed_limits="
+                f"{[round(v, 3) for v in hard_limits.joint_speed_limits]}, "
+                f"joint_acceleration_limits="
+                f"{[round(v, 3) for v in hard_limits.joint_acceleration_limits]}"
             )
 
         try:
@@ -279,25 +295,22 @@ class KinovaPoseControllerNode(Node):
                 f"mode={control_mode_name(limits.control_mode)}, "
                 f"twist_linear={limits.twist_linear:.3f} m/s, "
                 f"twist_angular={limits.twist_angular:.1f} deg/s, "
-                f"joint_speed_limits={[round(v, 3) for v in limits.joint_speed_limits]}, "
-                f"joint_acceleration_limits={[round(v, 3) for v in limits.joint_acceleration_limits]}"
+                f"joint_speed_limits="
+                f"{[round(v, 3) for v in limits.joint_speed_limits]}, "
+                f"joint_acceleration_limits="
+                f"{[round(v, 3) for v in limits.joint_acceleration_limits]}"
             )
 
     def _set_cartesian_soft_limits_to_hard_limits(self):
         try:
             hard_limits = self._control_config.GetKinematicHardLimits()
         except Exception as exc:
-            self.get_logger().error(f"Failed to query hard limits before setting soft limits: {exc}")
-            return
-
-        try:
-            soft_limits = self._control_config.GetAllKinematicSoftLimits()
-        except Exception as exc:
-            self.get_logger().error(f"Failed to query soft limits before setting cartesian limits: {exc}")
+            self.get_logger().error(
+                f"Failed to query hard limits before setting soft limits: {exc}"
+            )
             return
 
         self._hard_limits = hard_limits
-        supported_modes = {limits.control_mode for limits in soft_limits.kinematic_limits_list}
 
         linear_limit = ControlConfig_pb2.TwistLinearSoftLimit()
         linear_limit.twist_linear_soft_limit = hard_limits.twist_linear
@@ -312,67 +325,24 @@ class KinovaPoseControllerNode(Node):
         )
 
         for mode in cartesian_modes:
-            if mode not in supported_modes:
-                self.get_logger().warning(
-                    f"Skipping soft Cartesian limits for unsupported mode={control_mode_name(mode)}"
+            linear_limit.control_mode = mode
+            angular_limit.control_mode = mode
+            try:
+                self._control_config.SetTwistLinearSoftLimit(linear_limit)
+                self._control_config.SetTwistAngularSoftLimit(angular_limit)
+            except Exception as exc:
+                self.get_logger().error(
+                    f"Failed to set soft Cartesian limits for "
+                    f"mode={control_mode_name(mode)}: {exc}"
                 )
                 continue
 
-            linear_limit.control_mode = mode
-            angular_limit.control_mode = mode
-
-            linear_updated = False
-            angular_updated = False
-
-            try:
-                self._control_config.SetTwistLinearSoftLimit(linear_limit)
-                linear_updated = True
-            except Exception as exc:
-                self.get_logger().warning(
-                    "Failed to set soft Cartesian linear limit "
-                    f"for mode={control_mode_name(mode)}: {exc}"
-                )
-
-            try:
-                self._control_config.SetTwistAngularSoftLimit(angular_limit)
-            except Exception as exc:
-                self.get_logger().warning(
-                    "Failed to set soft Cartesian angular limit "
-                    f"for mode={control_mode_name(mode)}: {exc}"
-                )
-            else:
-                angular_updated = True
-
-            if linear_updated or angular_updated:
-                self.get_logger().info(
-                    "Updated soft Cartesian limits "
-                    f"mode={control_mode_name(mode)}, "
-                    f"twist_linear={hard_limits.twist_linear:.3f} m/s ({'ok' if linear_updated else 'unchanged'}), "
-                    f"twist_angular={hard_limits.twist_angular:.1f} deg/s ({'ok' if angular_updated else 'unchanged'})"
-                )
-
-    def move_to_euler_pose(
-        self,
-        x: float,
-        y: float,
-        z: float,
-        theta_x_deg: float,
-        theta_y_deg: float,
-        theta_z_deg: float,
-    ) -> bool:
-        self.get_logger().info(
-            "Executing direct euler move to "
-            f"x={x:.3f}, y={y:.3f}, z={z:.3f}, "
-            f"theta_x={theta_x_deg:.1f}, theta_y={theta_y_deg:.1f}, theta_z={theta_z_deg:.1f}"
-        )
-        return self._execute_cartesian_action(
-            x=x,
-            y=y,
-            z=z,
-            theta_x=theta_x_deg,
-            theta_y=theta_y_deg,
-            theta_z=theta_z_deg,
-        )
+            self.get_logger().info(
+                "Set soft Cartesian limits "
+                f"mode={control_mode_name(mode)}, "
+                f"twist_linear={hard_limits.twist_linear:.3f} m/s, "
+                f"twist_angular={hard_limits.twist_angular:.1f} deg/s"
+            )
 
     def _execute_cartesian_action(
         self,
