@@ -6,7 +6,7 @@ That file is the complete end-to-end script for this project: it handles ball de
 
 ## Whitepaper
 
-[Whitepaper](WHITEPAPER (https://drive.google.com/file/d/1cXi4zJHijt4oNvdxz10EJzX-FL62s8bK/view?usp=sharing))
+[Whitepaper](https://drive.google.com/file/d/1ezGyzaLbHz9VIY2MEQj9MzY5GHLofGP5/view?usp=sharing)
 
 ## Demo
 
