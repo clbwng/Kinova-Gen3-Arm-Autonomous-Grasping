@@ -1,5 +1,7 @@
 # Kinova Gen3 Ball Detection and Grasping
 
+WHITEPAPER (https://drive.google.com/file/d/1cXi4zJHijt4oNvdxz10EJzX-FL62s8bK/view?usp=sharing)
+
 This README documents only [`FINAL_FULL_PIPELINE.py`](FINAL_FULL_PIPELINE.py).
 
 That file is the complete end-to-end script for this project: it handles ball detection, real-time tracking, grasping, drop-off into the box, and returning the arm to its tracking pose. The other files in the repository are groundwork for future implementation and are not required to understand or run the current demo pipeline.
